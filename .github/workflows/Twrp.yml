@@ -1,0 +1,123 @@
+# .github/workflows/build-twrp.yml
+name: Build TWRP Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_codename:
+        description: 'Device codename (ej. a12s)'
+        required: true
+        default: 'a12s'
+      lunch_target:
+        description: 'Lunch target completo'
+        required: true
+        default: 'twrp_a12s-eng'
+      manifest_branch:
+        description: 'Rama del manifest de TWRP'
+        required: true
+        default: 'twrp-11'
+      device_tree_repo:
+        description: 'Repo del device tree (owner/repo)'
+        required: true
+      device_tree_branch:
+        description: 'Rama del device tree'
+        required: true
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt update
+          sudo apt install -y git-all python-is-python3 python3-pip aria2 \
+            bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev \
+            lib32readline-dev lib32z1-dev liblz4-tool libncurses5 \
+            libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools xsltproc zip \
+            zlib1g-dev cpio
+
+      - name: Configurar Git
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git config --global color.ui false
+
+      - name: Crear swapfile
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Instalar repo tool
+        run: |
+          mkdir -p ~/.bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+rx ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+      - name: Inicializar y sincronizar manifest de TWRP
+        run: |
+          mkdir -p ~/twrp-build
+          cd ~/twrp-build
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b ${{ inputs.manifest_branch }}
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune --force-sync -j$(nproc --all)
+
+      - name: Clonar device tree
+        run: |
+          cd ~/twrp-build
+          rm -rf device/samsung/${{ inputs.device_codename }}
+          git clone --depth=1 -b ${{ inputs.device_tree_branch }} \
+            https://github.com/${{ inputs.device_tree_repo }}.git \
+            device/samsung/${{ inputs.device_codename }}
+
+      - name: Compilar recovery image
+        run: |
+          cd ~/twrp-build
+          export ALLOW_MISSING_DEPENDENCIES=true
+          source build/envsetup.sh
+          lunch ${{ inputs.lunch_target }}
+          mka recoveryimage -j$(nproc --all)
+
+      - name: Localizar imagen generada
+        id: find_image
+        run: |
+          cd ~/twrp-build
+          IMG=$(find out/target/product/${{ inputs.device_codename }} -maxdepth 1 -name "recovery.img" -o -name "*.img" | head -n1)
+          echo "image_path=$IMG" >> "$GITHUB_OUTPUT"
+          echo "Imagen encontrada: $IMG"
+
+      - name: Subir imagen como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ inputs.device_codename }}-${{ github.run_number }}
+          path: ${{ steps.find_image.outputs.image_path }}
+          retention-days: 14
+
+      - name: Crear release (opcional)
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: twrp-${{ inputs.device_codename }}-${{ github.run_number }}
+          name: TWRP ${{ inputs.device_codename }} build ${{ github.run_number }}
+          files: ${{ steps.find_image.outputs.image_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
